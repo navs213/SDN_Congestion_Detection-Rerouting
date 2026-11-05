@@ -1,130 +1,155 @@
 # Project 27 – Congestion Detection and Traffic Rerouting (UDP + SDN)
 
-A UDP socket application runs over a two-path Mininet network controlled by a
-Ryu SDN controller. The controller monitors link load (OpenFlow port stats)
-and application QoS reports sent by the receiver, and detects congestion on
-the active path. In D2 it reroutes traffic to the less-loaded path.
+A UDP socket application runs over a three-path Mininet network controlled by a
+Ryu SDN controller. The controller learns every flow, classifies it as
+application (its receiver sends QoS reports) or background, and watches port
+statistics, per-flow rates, link status and the application's own QoS
+reports. When a path becomes congested it moves the application flows to the
+least-loaded path that has room (without chasing the flood). When a link
+fails it fails every flow over within milliseconds, measuring the time with an
+OpenFlow barrier, and fails back after the repair. A static mode (detect only)
+is the baseline for the performance comparison, and a live web dashboard shows
+loss, delay, throughput, path load, flow placement and recovery times.
 
-Full design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Tests: [docs/TEST_CASES.md](docs/TEST_CASES.md)
+Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Tests: [docs/TEST_CASES.md](docs/TEST_CASES.md) ·
+Final demo script: [DEMO_D2.md](DEMO_D2.md) · Results: `results/RESULTS.md` (after running the experiments)
 
 ## Topology
 
 ```
             +---- s2 ----+
- h1,h2,h4 - s1            s4 - h3, h5          h3 === VM (management link for QoS reports)
-            +---- s3 ----+
-  Path A: s1-s2-s4 (default)   Path B: s1-s3-s4 (alternate)   10 Mbps, 2 ms per link
+ h1,h2,h4 - s1 --- s3 --- s4 - h3, h5          h3 === VM (management link)
+            +---- s5 ----+
+  Path A: s1-s2-s4 (default)   Path B: s1-s3-s4   Path C: s1-s5-s4
+  10 Mbps, 2 ms per link
 ```
 
 | Host | IP | Role |
 |---|---|---|
-| h1, h2 | 10.0.0.1, 10.0.0.2 | UDP senders |
-| h3 | 10.0.0.3 (mgmt 192.168.100.3) | UDP receiver, sends QoS reports |
-| h4 → h5 | 10.0.0.4 → 10.0.0.5 | background traffic (creates congestion) |
-| Ryu | 127.0.0.1:6653 / 192.168.100.1:9000 | OpenFlow / QoS report listener |
+| h1, h2 | 10.0.0.1, 10.0.0.2 | UDP senders (application) |
+| h3 | 10.0.0.3 (mgmt 192.168.100.3) | UDP receiver: QoS reports out, SDN events in |
+| h4 → h5 | 10.0.0.4 → 10.0.0.5 | background flood (creates congestion) |
+| Ryu | 127.0.0.1:6653 · UDP 9000 | OpenFlow · QoS reports and commands |
 
 ## Files
 
 | File | What it does |
 |---|---|
-| `topology.py` | Two-path Mininet topology, static ARP, management link h3 ↔ VM |
-| `controller.py` | Ryu app: flow rules, port-stats monitoring, QoS listener, congestion detection |
-| `udp_sender.py` | Rate-controlled UDP client; header = magic, sender id, seq, timestamp |
-| `udp_receiver.py` | UDP server for many clients; per-flow throughput/loss/delay/jitter; CSV; QoS reports |
-| `docs/ARCHITECTURE.md` | Problem, objectives, components, message formats, communication flow |
-| `docs/TEST_CASES.md` | D1 test cases with expected results |
+| `udp_sender.py` | Rate-controlled UDP client; header = magic, sender id, seq, timestamp; end-of-stream marker |
+| `udp_receiver.py` | UDP server for many clients; per-second throughput/loss/delay/jitter; stall detection; QoS reports; SDN event channel (UDP 5002) with failover and recovery timings; CSV |
+| `topology.py` | Three-path Mininet topology, static ARP, management link h3 ↔ VM |
+| `controller.py` | Ryu app: flow learning and classification, load-aware placement, congestion relief, link failover with barrier timing, failback, static/dynamic modes, live state for the dashboard |
+| `dashboard.py` | Live web dashboard on http://localhost:8000 (standard library only, works offline) |
+| `run_experiments.py` | Runs every scenario in static and dynamic mode automatically |
+| `analyze.py` | Turns the results into `RESULTS.md`, `summary.csv` and plots |
+| `docs/` | Architecture, test cases |
+| `results/early_run/` | Data from the team's first D2 run on the VM |
 
-## Setup
+## Setup (once)
 
-Tested on Ubuntu 26.04 in VirtualBox with Mininet 2.3.0 and Ryu 4.34.
+Tested with Mininet 2.3.0 and Ryu 4.34 (Ryu needs Python 3.9–3.11).
 
 ```bash
 sudo apt update
-sudo apt install mininet openvswitch-switch curl -y
+sudo apt install mininet openvswitch-switch xterm curl python3-matplotlib -y
 
-# Ryu needs Python 3.9; uv provides it without touching the system Python
 curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.bashrc
-uv python install 3.9
-uv venv ~/ryu-env --python 3.9 --seed
+uv python install 3.11
+uv venv ~/ryu-env --python 3.11 --seed
 source ~/ryu-env/bin/activate
 pip install setuptools==67.6.1 wheel pbr
 pip install --no-build-isolation ryu
-pip install eventlet==0.30.2
+pip install eventlet==0.33.3
 ryu-manager --version          # ryu-manager 4.34
 ```
-
-(On Ubuntu 20.04/22.04 you can skip uv: `pip3 install setuptools==67.6.1 wheel pbr`,
-`pip3 install --no-build-isolation ryu`, `pip3 install eventlet==0.30.2`.)
+If your Ryu environment lives elsewhere (for example `ryu311-venv` inside the
+project), activate that one instead. Virtual environments are listed in
+`.gitignore` and must not be committed.
 
 ## Running
 
-**Order matters:** clean up first, then the controller, then the topology.
-(`sudo mn -c` kills `ryu-manager`, so never run it after the controller is up.)
+**Order matters:** `sudo mn -c` first, then the controller, then the topology
+(`sudo mn -c` kills `ryu-manager`).
 
 ```bash
 # Terminal 2
 sudo mn -c
+xhost +SI:localuser:root
 
-# Terminal 1 – controller
-source ~/ryu-env/bin/activate
-cd ~/project27
+# Terminal 1 – controller (dynamic by default; P27_MODE=static for the baseline)
+source ~/ryu-env/bin/activate && cd ~/SDN
 ryu-manager controller.py
 
-# Terminal 2 – topology
-cd ~/project27
-sudo python3 topology.py
-mininet> pingall               # expect 0% dropped (20/20)
+# Terminal 3 – dashboard, then open http://localhost:8000
+cd ~/SDN && python3 dashboard.py
+
+# Terminal 2 – network
+cd ~/SDN && sudo python3 topology.py
+mininet> pingall
+mininet> xterm h1 h2 h3 h4 h5
 ```
 
-### Normal traffic
+Host windows:
 ```bash
-mininet> xterm h1 h2 h3
-# h3
-python3 udp_receiver.py --port 5001 --csv baseline.csv --report-to 192.168.100.1:9000
-# h1
-python3 udp_sender.py --dst 10.0.0.3 --rate 2 --duration 60 --id 1
-# h2
-python3 udp_sender.py --dst 10.0.0.3 --rate 2 --duration 60 --id 2
+# h5, then h3
+python3 udp_receiver.py --port 5001
+python3 udp_receiver.py --port 5001 --csv live.csv --report-to 192.168.100.1:9000
+# h1, h2
+python3 udp_sender.py --dst 10.0.0.3 --rate 2 --duration 900 --id 1
+python3 udp_sender.py --dst 10.0.0.3 --rate 2 --duration 900 --id 2
 ```
-The controller logs QoS reports and Path A at about 40% utilization.
 
-### Controlled congestion
-While the senders are running, at the `mininet>` prompt:
+Problems to create while they run:
 ```bash
-mininet> h5 python3 udp_receiver.py --port 5001 > /tmp/h5.log 2>&1 &
-mininet> h4 python3 udp_sender.py --dst 10.0.0.5 --rate 9 --duration 20 --id 99 > /tmp/h4.log 2>&1 &
+# congestion – in h4
+python3 udp_sender.py --dst 10.0.0.5 --rate 9 --duration 20 --id 99
+# link failure (and repair) – at mininet>
+mininet> link s1 s2 down
+mininet> link s1 s2 up
 ```
-The controller logs `CONGESTION DETECTED on Path A (...)`, the h3 receiver shows
-loss and delay rising, and 20 s later `Congestion cleared on Path A`.
+Switch **Static** / **Dynamic** with the dashboard buttons and repeat.
 
-### Useful commands
+## Performance evaluation
+
 ```bash
-mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s1     # rules installed by the controller
-mininet> h3 ping -c 2 192.168.100.1                    # management link to controller
-mininet> exit                                          # then Ctrl+C the controller, then sudo mn -c
+# controller running in Terminal 1, nothing else using Mininet
+cd ~/SDN
+sudo python3 run_experiments.py           # 10 runs, about 11 minutes
+sudo python3 run_experiments.py --quick   # 4 runs, about 4.5 minutes
+python3 analyze.py results
 ```
+
+| Scenario | What happens (15 s into a 45 s run) |
+|---|---|
+| congestion-7 / -9 / -12 | h4 floods 7, 9 or 12 Mbps over Path A for 20 s |
+| failure | link s1–s2 down for 15 s |
+| double-failure | link s1–s2 down, then s1–s3 7 s later, both up at 15 s |
+
+Each runs in static and dynamic mode under identical conditions. Output in
+`results/`: per-run CSVs and controller events, `summary.csv`, `RESULTS.md`
+(tables, including failover timings), `plot_<scenario>.png` and `comparison.png`.
 
 ## Configuration
 
-| Setting | Where | Default |
+`controller.py` constants: `UTIL_THRESHOLD` 0.80, `LOSS_THRESHOLD` 5%,
+`POLL_INTERVAL` 1 s, `REROUTE_HOLD` 6 s, `RESTORE_STABLE` 5 s,
+`LINK_CAPACITY_MBPS` 10 (must match `topology.py --bw`).
+
+| Environment variable | Default | Meaning |
 |---|---|---|
-| Path link bandwidth | `topology.py --bw` and `LINK_CAPACITY_MBPS` in `controller.py` (keep equal) | 10 Mbps |
-| Utilization threshold | `UTIL_THRESHOLD` in `controller.py` | 80% |
-| Loss threshold | `LOSS_THRESHOLD` in `controller.py` | 5% |
-| Stats poll interval | `POLL_INTERVAL` in `controller.py` | 2 s |
-| QoS report port | `QOS_PORT` in `controller.py`, `--report-to` on receiver | 9000 |
+| `P27_MODE` | dynamic | starting mode (also switchable from the dashboard) |
+| `P27_PLACEMENT` | fixed | `fixed`: new flows start on Path A; `load`: on the least-loaded path |
+| `P27_APP_HOSTS` | 10.0.0.3 | IPs always treated as application receivers |
+| `P27_FAILBACK` | on | move displaced flows back after a repair |
+| `P27_RESTORE_STABLE` | 5 | seconds a repaired path must stay up first |
+| `SDN_STATE_FILE` | /tmp/sdn_live_state.json | live state for the dashboard |
 
 ## Status
 
-**D1**
-- [x] Two-path topology with bandwidth/delay-limited links
-- [x] SDN controller with proactive flow rules
-- [x] Port-stats monitoring and threshold-based congestion detection
-- [x] UDP sender/receiver: multiple clients, custom header, error handling, QoS metrics, CSV logging
-- [x] Socket → SDN integration: receiver QoS reports drive the controller's congestion decision
-- [x] Architecture document and test cases
-
-**D2**
-- [ ] Automatic rerouting to Path B (`set_path()` is ready; see the comment in `_evaluate()`)
-- [ ] Link-failure scenario
-- [ ] Static vs dynamic comparison: recovery time, throughput, loss, with plots from the CSVs
+- [x] D1: topology, controller, monitoring, congestion detection, UDP app, QoS reports
+- [x] Flow learning and APP/BG classification
+- [x] Load-aware congestion relief that never chases the flood
+- [x] Link failover with barrier-confirmed timing, failback after repair
+- [x] Stall detection (failures measured as 100% loss) and recovery timing
+- [x] Static vs dynamic experiments under 5 conditions, tables and plots
+- [x] Live dashboard with mode switch

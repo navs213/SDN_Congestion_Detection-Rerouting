@@ -3,21 +3,23 @@
 Multi-path Mininet topology for Project 27 (Congestion Detection & Traffic Rerouting).
 
             +---- s2 ----+
- h1,h2,h4 - s1            s4 - h3, h5
-            +---- s3 ----+
+ h1,h2,h4 - s1 --- s3 --- s4 - h3, h5
+            +---- s5 ----+
 
   Path A: s1 -> s2 -> s4   (default path, will be congested)
   Path B: s1 -> s3 -> s4   (alternate path)
+  Path C: s1 -> s5 -> s4   (second alternate path)
 
   h1, h2 : UDP senders (application traffic)
   h3     : UDP receiver (also sends QoS reports to the controller)
   h4, h5 : background-traffic pair used to create controlled congestion
 
 Switch port numbers are fixed so the controller can rely on them:
-  s1: 1=h1 2=h2 3=h4 4=s2 5=s3
+  s1: 1=h1 2=h2 3=h4 4=s2 5=s3 6=s5
   s2: 1=s1 2=s4
   s3: 1=s1 2=s4
-  s4: 1=h3 2=s2 3=s3 4=h5
+  s4: 1=h3 2=s2 3=s3 4=h5 5=s5
+  s5: 1=s1 2=s4
 
 Management link (out-of-band, does NOT go through the OpenFlow switches):
   h3-eth1 (192.168.100.3)  <-->  root-eth0 (192.168.100.1, the VM itself)
@@ -50,7 +52,7 @@ class MultiPathTopo(Topo):
                                     mac=f'00:00:00:00:00:0{i}')
 
         sw = {}
-        for i in range(1, 5):
+        for i in range(1, 6):
             sw[i] = self.addSwitch(f's{i}', dpid=f'{i:016x}',
                                    protocols='OpenFlow13')
 
@@ -70,6 +72,10 @@ class MultiPathTopo(Topo):
         # Path B: s1 - s3 - s4
         self.addLink(sw[1], sw[3], port1=5, port2=1, **path_link)
         self.addLink(sw[3], sw[4], port1=2, port2=3, **path_link)
+
+        # Path C: s1 - s5 - s4
+        self.addLink(sw[1], sw[5], port1=6, port2=1, **path_link)
+        self.addLink(sw[5], sw[4], port1=2, port2=5, **path_link)
 
 
 def add_management_link(net):
