@@ -5,13 +5,17 @@ UDP sender (client) for Project 27.
 Sends fixed-size UDP datagrams at a controlled rate. Each datagram starts with
 an application header the receiver uses to measure loss, delay and jitter:
 
-  magic (4 bytes 'JKFT') | sender_id (uint16) | seq (uint32) | send_ts (float64)
+  magic (4 bytes) | sender_id (uint16) | seq (uint32) | send_ts (float64)
+
+  magic 'JKFT' = data packet
+  magic 'JKFE' = end-of-stream marker (sent 3 times when the sender finishes),
+                 so the receiver can tell "sender finished" from "network
+                 outage" (a silent flow that never said goodbye = stalled).
 
 Usage (on h1 / h2):
-  python3 udp_sender.py --dst 10.0.0.3 --rate 2 --duration 30 --id 1
-  python3 udp_sender.py --dst 10.0.0.3 --rate 2 --duration 30 --id 2
+  python3 udp_sender.py --dst 10.0.0.3 --rate 2 --duration 60 --id 1
 Background congestion (on h4, toward h5):
-  python3 udp_sender.py --dst 10.0.0.5 --rate 9 --duration 60 --id 99
+  python3 udp_sender.py --dst 10.0.0.5 --rate 9 --duration 20 --id 99
 """
 
 import argparse
@@ -21,6 +25,7 @@ import time
 
 HEADER = struct.Struct('!4sHId')
 MAGIC = b'JKFT'
+MAGIC_END = b'JKFE'
 
 
 def main():
@@ -37,13 +42,15 @@ def main():
         p.error(f'--size must be at least {HEADER.size} bytes')
     if args.rate <= 0:
         p.error('--rate must be positive')
+    if not 0 <= args.id <= 65535:
+        p.error('--id must be between 0 and 65535')
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     padding = b'x' * (args.size - HEADER.size)
     gap = args.size * 8 / (args.rate * 1e6)      # seconds between packets
 
     print(f'[sender {args.id}] -> {args.dst}:{args.port}  {args.rate} Mbps, '
-          f'{args.size} B packets, {args.duration} s')
+          f'{args.size} B packets, {args.duration} s', flush=True)
 
     seq = sent = errors = 0
     start = time.time()
@@ -60,17 +67,25 @@ def main():
             except OSError as e:          # e.g. network unreachable, buffer full
                 errors += 1
                 if errors <= 5:
-                    print(f'[sender {args.id}] send error: {e}')
+                    print(f'[sender {args.id}] send error: {e}', flush=True)
             seq += 1
             next_send += gap
     except KeyboardInterrupt:
         pass
     finally:
+        # Tell the receiver this flow ended on purpose.
+        for _ in range(3):
+            try:
+                sock.sendto(HEADER.pack(MAGIC_END, args.id, seq, time.time()),
+                            (args.dst, args.port))
+            except OSError:
+                pass
+            time.sleep(0.01)
         elapsed = time.time() - start
         sock.close()
         rate = sent * args.size * 8 / elapsed / 1e6 if elapsed > 0 else 0
         print(f'[sender {args.id}] done: sent={sent} errors={errors} '
-              f'time={elapsed:.1f}s avg={rate:.2f} Mbps')
+              f'time={elapsed:.1f}s avg={rate:.2f} Mbps', flush=True)
 
 
 if __name__ == '__main__':

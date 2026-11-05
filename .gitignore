@@ -1,2 +1,12 @@
+# Python virtual environments and Ryu sources (install them, don't commit them)
+*venv*/
+ryu-env/
+ryu-source/
 __pycache__/
 *.pyc
+__MACOSX/
+.DS_Store
+# live runs and logs (experiment results in results/ are kept)
+/*.csv
+/*.log
+/qos_metrics.csv
